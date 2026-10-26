@@ -1,0 +1,4 @@
+customer_id,reason
+C107,fraud
+C108,default
+C999,old_case

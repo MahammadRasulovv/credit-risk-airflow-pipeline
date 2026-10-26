@@ -1,0 +1,7 @@
+apache-airflow-providers-standard
+apache-airflow-providers-common-sql
+apache-airflow-providers-postgres
+apache-airflow-providers-fab
+apache-airflow-providers-apache-spark==5.3.3
+pyspark==3.5.3
+delta-spark==3.3.2
