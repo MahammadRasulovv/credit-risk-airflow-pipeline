@@ -1,168 +1,143 @@
-
 import os
-import argparse
+import sys
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, lit, trim, upper
+from pyspark.sql import functions as F
 
 
-# DAG-dan gələn parametrlər
-parser = argparse.ArgumentParser()
-parser.add_argument("--table", required=True)
-parser.add_argument("--s3-path", required=True)
-args = parser.parse_args()
+table = sys.argv[1]
+s3_path = sys.argv[2]
 
 
-# PostgreSQL və MinIO məlumatları
-pg_user = os.environ["PG_USER"]
-pg_password = os.environ["PG_PASSWORD"]
-
-minio_user = os.environ["MINIO_ROOT_USER"]
-minio_password = os.environ["MINIO_ROOT_PASSWORD"]
-
-
-# SparkSession
 spark = (
     SparkSession.builder
-    .appName("CreditRiskPipeline")
+    .appName("CreditRiskProcessing")
+    .config("spark.hadoop.fs.s3a.endpoint", os.environ["MINIO_ENDPOINT"])
+    .config("spark.hadoop.fs.s3a.access.key", os.environ["MINIO_ACCESS_KEY"])
+    .config("spark.hadoop.fs.s3a.secret.key", os.environ["MINIO_SECRET_KEY"])
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
     .config(
-        "spark.sql.extensions",
-        "io.delta.sql.DeltaSparkSessionExtension"
-    )
-    .config(
-        "spark.sql.catalog.spark_catalog",
-        "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+        "spark.hadoop.fs.s3a.aws.credentials.provider",
+        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
     )
     .getOrCreate()
 )
 
-spark.sparkContext.setLogLevel("WARN")
+jdbc_url = (
+    f"jdbc:postgresql://{os.environ['PG_HOST']}:"
+    f"{os.environ['PG_PORT']}/{os.environ['PG_DATABASE']}"
+)
 
-try:
-    # MinIO konfiqurasiyası
-    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+properties = {
+    "user": os.environ["PG_USER"],
+    "password": os.environ["PG_PASSWORD"],
+    "driver": "org.postgresql.Driver"
+}
 
-    hconf.set("fs.s3a.endpoint", "http://minio:9000")
-    hconf.set("fs.s3a.access.key", minio_user)
-    hconf.set("fs.s3a.secret.key", minio_password)
-    hconf.set("fs.s3a.path.style.access", "true")
-    hconf.set("fs.s3a.connection.ssl.enabled", "false")
-    hconf.set(
-        "fs.s3a.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+
+applications_df = spark.read.jdbc(
+    url=jdbc_url,
+    table=table,
+    properties=properties
+)
+
+
+applications_df.show(10, truncate=False)
+
+print("Total applications:", applications_df.count())
+
+
+blacklist_df = spark.read.csv(
+    "/opt/airflow/data/blacklist.csv",
+    header=True
+)
+
+blacklist_df.show()
+
+print("Blacklist records:", blacklist_df.count())
+
+
+applications_df = applications_df.withColumn(
+    "customer_id",
+    F.trim(F.col("customer_id"))
+)
+
+blacklist_df = blacklist_df.withColumn(
+    "customer_id",
+    F.trim(F.col("customer_id"))
+)
+
+joined_df = applications_df.join(
+    blacklist_df,
+    on="customer_id",
+    how="left"
+)
+
+joined_df.select(
+    "customer_id",
+    "customer_name",
+    "reason"
+).show(10, truncate=False)
+
+print("Joined rows:", joined_df.count())
+
+joined_df.filter(
+    F.col("reason").isNotNull()
+).select(
+    "customer_id", "reason"
+).show()
+
+
+result_df = joined_df.withColumn(
+    "risk_status",
+    F.when(
+        F.col("reason").isNotNull(),
+        "rejected"
     )
-
-    # PostgreSQL-dən məlumatların oxunması
-    df = (
-        spark.read
-        .format("jdbc")
-        .option("url", "jdbc:postgresql://postgres:5432/airflow")
-        .option("dbtable", args.table)
-        .option("user", pg_user)
-        .option("password", pg_password)
-        .option("driver", "org.postgresql.Driver")
-        .load()
+    .when(
+        (F.col("requested_amount") > F.col("monthly_income") * 12)
+        | (F.col("existing_debt") > F.col("monthly_income") * 0.7)
+        | (F.col("employment_years") < 1)
+        | (F.col("age") < 21),
+        "high_risk"
     )
+    .otherwise("approved")
+)
 
-    print("POSTGRES ROW COUNT:", df.count())
+result_df.select(
+    "customer_id",
+    "customer_name",
+    "risk_status"
+).show(10, truncate=False)
 
-    # customer_id təmizlənməsi
-    df = df.withColumn(
-        "customer_id",
-        upper(trim(col("customer_id")))
-    )
+result_df.groupBy("risk_status").count().show()
 
-    # Blacklist CSV oxunması
-    blacklist = (
-        spark.read
-        .option("header", "true")
-        .option("inferSchema", "false")
-        .csv("/opt/airflow/data/blacklist.csv")
-        .select(
-            upper(trim(col("customer_id"))).alias("customer_id")
-        )
-        .distinct()
-        .withColumn("is_blacklisted", lit(True))
-    )
+result_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .partitionBy("application_date") \
+    .save(s3_path)
 
-    # Blacklist yoxlanması
-    print("BLACKLIST DATA:")
-    blacklist.show(truncate=False)
+print(f"Delta Lake data saved to: {s3_path}")
 
-    # LEFT JOIN
-    joined = df.join(
-        blacklist,
-        on="customer_id",
-        how="left"
-    )
+delta_df = (
+    spark.read
+    .format("delta")
+    .load(s3_path)
+)
 
-    print("BLACKLIST MATCHES:")
-    joined.filter(
-        col("is_blacklisted") == True
-    ).select(
-        "customer_id",
-        "is_blacklisted"
-    ).show(truncate=False)
+delta_df.select(
+    "customer_id",
+    "customer_name",
+    "application_date",
+    "risk_status"
+).show(10, truncate=False)
 
-    # Risk statusunun hesablanması
-    result = (
-        joined
-        .withColumn(
-            "risk_status",
-            when(
-                col("is_blacklisted") == True,
-                "rejected"
-            )
-            .when(
-                (col("requested_amount") > col("monthly_income") * 12)
-                | (col("existing_debt") > col("monthly_income") * 0.7)
-                | (col("employment_years") < 1)
-                | (col("age") < 21),
-                "high_risk"
-            )
-            .otherwise("approved")
-        )
-        .drop("is_blacklisted")
-    )
+print("Delta records:", delta_df.count())
 
-    # Risk nəticələri
-    print("RISK STATUS RESULTS:")
+delta_df.groupBy("risk_status").count().show()
 
-    status_counts = (
-        result
-        .groupBy("risk_status")
-        .count()
-    )
 
-    status_counts.show(truncate=False)
-
-    # Nəticənin yoxlanması
-    actual_counts = {
-        row["risk_status"]: row["count"]
-        for row in status_counts.collect()
-    }
-
-    expected_counts = {
-        "approved": 4,
-        "high_risk": 4,
-        "rejected": 2
-    }
-
-    if actual_counts != expected_counts:
-        raise ValueError(
-            f"Risk status nəticəsi yanlışdı: {actual_counts}"
-        )
-
-    # Delta formatında MinIO-ya yazma
-    (
-        result.write
-        .format("delta")
-        .mode("overwrite")
-        .partitionBy("application_date")
-        .save(args.s3_path)
-    )
-
-    print("DELTA WRITE SUCCESS:", args.s3_path)
-
-finally:
-    spark.stop()
+spark.stop()

@@ -1,138 +1,104 @@
-# credit_risk_pipeline
+# Credit Risk Pipeline
 
-Kredit müraciətlərini risk statusuna görə təsnif edən end-to-end data pipeline. **Apache Airflow 3.1** pipeline-ı idarə edir, **PostgreSQL** mənbə datanı saxlayır, **PySpark** datanı `blacklist.csv` ilə birləşdirib `risk_status` hesablayır, nəticə **MinIO**-da (S3) **Delta Lake** formatında saxlanır. Hamısı Docker Compose ilə lokal qalxır.
+**Apache Airflow 3 · PostgreSQL · PySpark · Delta Lake · MinIO · Docker Compose**
 
-## Mündəricat
+PostgreSQL-də saxlanılan kredit müraciətlərini CSV blacklist ilə birləşdirən, risk statusunu hesablayan və nəticələri MinIO üzərində **Delta Lake** cədvəlinə yazan end-to-end data engineering layihəsi. Airflow sensorlar, conditional branching, Spark job və failure handling prosesini idarə edir.
 
-1. [Ümumi baxış](#1-ümumi-baxış)
-2. [Layihə strukturu](#2-layihə-strukturu)
-3. [İnfrastruktur](#3-i̇nfrastruktur)
-4. [Data](#4-data)
-5. [Connection və Variable](#5-connection-və-variable)
-6. [Spark job](#6-spark-job)
-7. [DAG](#7-dag)
-8. [Testlər və screenshot-lar](#8-testlər-və-screenshotlar)
-9. [Bonus](#9-bonus)
-10. [Necə işə salmaq olar](#10-necə-işə-salmaq-olar)
-11. [Dizayn qərarları və qeydlər](#11-dizayn-qərarları-və-qeydlər)
-12. [Tapşırıq tələbləri: harada nə var](#12-tapşırıq-tələbləri-harada-nə-var)
+> **Layihənin statusu:** Lokal mühitdə həm uğurlu, həm də uğursuz branching ssenariləri **DAG v4** üzərində test olunub. Bu, tədris məqsədli kredit risk qaydalarıdır; real bank risk modeli deyil.
 
----
+## Nəticələr
 
-## 1. Ümumi baxış
+| Göstərici | Nəticə |
+|---|---|
+| PostgreSQL mənbə datası | **10** kredit müraciəti |
+| `2026-03-12` tarixi üçün müraciət | **8** → Spark işləyir |
+| `2026-03-11` tarixi üçün müraciət | **2** → `fail_task` işləyir |
+| Risk statusları | **4 approved · 4 high_risk · 2 rejected** |
+| Saxlama formatı | **Delta Lake**, `application_date` üzrə partition |
+| Müsbət DAG run | **SUCCESS**, təqribən **27 saniyə** (lokal test) |
+| Mənfi DAG run | **FAILED**; `end_task` yenə `SUCCESS` |
+
+![DAG v4 — successful branch](screenshots/01_happy_path_v4.png)
+
+## 1. Arxitektura
 
 ```mermaid
-flowchart LR
-    PG[(PostgreSQL<br/>credit_applications)] --> SP[Spark job<br/>credit_risk_job.py]
-    BL[blacklist.csv] --> SP
-    SP -->|Delta, partitionBy application_date| MN[(MinIO<br/>s3a://credit/delta/credit_applications)]
-    AF[Airflow DAG<br/>credit_risk_pipeline] -->|SparkSubmitOperator / BashOperator| SP
+flowchart TD
+    START([start]) --> SQL["SqlSensor<br/>check_yesterday_data"]
+    START --> FILE["FileSensor<br/>check_blacklist_file"]
+    SQL --> BR{"branch_on_row_count<br/>yesterday count > 2?"}
+    FILE --> BR
+    BR -->|Yes| SP["SparkSubmitOperator<br/>run_spark"]
+    BR -->|No| FAIL["PythonOperator<br/>fail_task"]
+    SP --> END["end_task<br/>all_done"]
+    FAIL --> END
+    END --> FINAL["final_status<br/>none_failed_min_one_success"]
+    SP -.-> FINAL
+    FAIL -.-> FINAL
+
+    PG[("PostgreSQL<br/>credit_applications")] -. JDBC .-> SP
+    CSV["blacklist.csv"] -. LEFT JOIN .-> SP
+    SP -. Delta write .-> MINIO[("MinIO / S3A<br/>credit/delta/credit_applications")]
 ```
 
-**Risk qaydaları** (yuxarıdan aşağı, ilk uyğun qalır):
+**İcra ardıcıllığı:**
 
-| Status | Şərt |
+1. `start` iki sensoru başladır: SQL cədvəlində əvvəlki günə aid məlumat, konteynerdə blacklist CSV faylı.
+2. `branch_on_row_count` əvvəlki günün müraciətlərini PostgreSQL-də sayır.
+3. Say **2-dən çoxdursa**, `run_spark` PostgreSQL-i JDBC ilə oxuyur, blacklist-i LEFT JOIN edir, `risk_status` hesablayır və Delta Lake-ə yazır.
+4. Say **2 və ya daha azdırsa**, `fail_task` qəsdən `AirflowFailException` yaradır və `run_spark` skip olunur.
+5. `end_task` (`all_done`) hər iki nəticədən sonra işləyir. `final_status` isə əvvəlki uğursuzluqların ümumi **DAG FAILED** vəziyyətinə düzgün ötürülməsini təmin edir.
+
+`SqlSensor` **məlumatın mövcudluğunu** yoxlayır (`COUNT(*) > 0`). **`COUNT(*) > 2`** biznes şərti isə ayrıca `BranchPythonOperator`-dadır.
+
+## 2. Texnologiyalar
+
+| Texnologiya | Rol |
 |---|---|
-| `rejected` | müştəri blacklist-dədir |
-| `high_risk` | `requested_amount > monthly_income * 12` **və ya** `existing_debt > monthly_income * 0.7` **və ya** `employment_years < 1` **və ya** `age < 21` |
-| `approved` | qalan hamısı |
+| **Apache Airflow 3.1** | Orkestrasiya, sensorlar, branching, callbacks, trigger rules |
+| **PostgreSQL 16** | `public.credit_applications` mənbə cədvəli |
+| **Apache Spark / PySpark 3.5.3** | JDBC oxuma, CSV oxuma, LEFT JOIN, risk hesablanması |
+| **Delta Lake 3.3.2** | Transaction log və partition-lu çıxış cədvəli |
+| **MinIO** | Lokal S3-compatible object storage |
+| **Docker Compose** | Airflow, PostgreSQL və MinIO servisləri |
 
----
+Spark submit zamanı PostgreSQL JDBC, Delta Lake və Hadoop S3A paketləri əlavə olunur (`postgresql:42.7.4`, `delta-spark_2.12:3.3.2`, `hadoop-aws:3.3.4`).
 
-## 2. Layihə strukturu
+## 3. Repository strukturu
 
-```
-.
-├── docker-compose.yaml        # postgres, airflow (init/api-server/scheduler/dag-processor), minio
-├── Dockerfile                 # apache/airflow:3.1.0 + Java 17 + requirements
-├── requirements.txt           # Airflow provider-ləri, pyspark, delta-spark
-├── .env                       # mühit dəyişənləri (repo-ya qoyulmur)
-├── customer.csv               # başlanğıc data (Postgres konteyneri /tmp/customer.csv kimi görür)
+```text
+credit-risk-airflow-pipeline/
+├── README.md
+├── .env.example
+├── .gitignore
+├── docker-compose.yaml
+├── Dockerfile
+├── requirements.txt
+├── customer.csv                 # mənbə data nümunəsi
 ├── sql/
 │   ├── create_table.sql
 │   └── insert.sql
 ├── airflow/
-│   ├── dags/credit_risk_pipeline.py
-│   ├── spark_jobs/credit_risk_job.py
-│   ├── data/blacklist.csv
-│   ├── files/  logs/  config/  plugins/
+│   ├── dags/
+│   │   └── credit_risk_pipeline.py
+│   ├── spark_jobs/
+│   │   └── credit_risk_job.py
+│   └── data/
+│       └── blacklist.csv
 └── screenshots/
+    ├── 01_happy_path_v4.png
+    ├── 02_failure_path_v4.png
+    ├── 03_failure_callback_log.png
+    └── 04_delta_table_minio.png
 ```
 
-`airflow/` qovluğundakı alt qovluqlar konteynerlərə volume kimi qoşulur (`/opt/airflow/dags`, `/opt/airflow/spark_jobs`, `/opt/airflow/data` və s.).
+**Qeyd:** Bu README işlək **yenilənmiş** `credit_risk_pipeline.py` və `credit_risk_job.py` kodlarını təsvir edir. GitHub-dakı köhnə kodlar da ayrıca yeni lokal fayllarla əvəz edilməlidir. `daily_city_sales` kimi digər lokal tədris faylları bu repository-nin hissəsi deyil.
 
----
+## 4. Mənbə data və risk qaydaları
 
-## 3. İnfrastruktur
+`public.credit_applications` cədvəlində əsas sahələr: `application_id`, `customer_id`, `customer_name`, `requested_amount`, `monthly_income`, `existing_debt`, `employment_years`, `age`, `application_date`.
 
-### Docker Compose servisləri
-
-| Servis | Təsvir | Port (host) |
-|---|---|---|
-| `postgres` | `postgres:16`, həm Airflow metadata bazası, həm də `credit_applications` cədvəli. `customer.csv` konteynerə `/tmp/customer.csv` kimi qoşulur. | `5436 → 5432` |
-| `airflow-init` | `db migrate` edir və `admin` istifadəçisini yaradır, sonra dayanır. | |
-| `airflow-api-server` | Airflow UI və API. | `8080` |
-| `airflow-scheduler` | Task-ları planlaşdırır (`LocalExecutor`). | |
-| `airflow-dag-processor` | DAG fayllarını parse edir (Airflow 3-də ayrıca servisdir). | |
-| `minio` | S3-uyğun obyekt saxlama, image `minio/minio:RELEASE.2025-04-22T22-12-26Z`. | `9000` (API), `9001` (Console) |
-
-Airflow servisləri eyni `x-airflow-common` blokunu istifadə edir (build, env_file, volume-lar). Hamısı `lake` adlı bridge şəbəkəsindədir, ona görə konteynerlər bir-birini adla tapır (`postgres`, `minio`). `postgres` servisində healthcheck var və Airflow servisləri onun hazır olmasını gözləyir.
-
-### Dockerfile
-
-`apache/airflow:3.1.0` üzərində qurulur:
-- `openjdk-17-jre-headless` quraşdırılır, çünki `spark-submit` Java tələb edir.
-- `git`, `bash`, `curl`, `unzip` əlavə olunur.
-- `requirements.txt` pip ilə quraşdırılır.
-
-### requirements.txt
-
-| Paket | Məqsəd |
-|---|---|
-| `apache-airflow-providers-standard` | `EmptyOperator`, `PythonOperator`, `BranchPythonOperator`, `BashOperator`, `FileSensor` |
-| `apache-airflow-providers-common-sql` | `SqlSensor` |
-| `apache-airflow-providers-postgres` | `PostgresHook`, Postgres Connection tipi |
-| `apache-airflow-providers-fab` | Airflow 3-də FAB auth manager |
-| `apache-airflow-providers-apache-spark==5.3.3` | `SparkSubmitOperator` |
-| `pyspark==3.5.3` | Spark runtime (`spark-submit` buradan gəlir) |
-| `delta-spark==3.3.2` | Delta Lake Python API |
-
-### .env dəyişənləri
-
-| Qrup | Dəyişənlər |
-|---|---|
-| Image | `AIRFLOW_IMAGE_NAME`, `AIRFLOW_PROJ_DIR`, `AIRFLOW_UID` |
-| Airflow | `EXECUTOR=LocalExecutor`, `SQL_ALCHEMY_CONN`, `FERNET_KEY`, `AUTH_MANAGER` (FAB), `EXECUTION_API_SERVER_URL`, `API__SECRET_KEY`, `API_AUTH__JWT_SECRET`, `LOAD_EXAMPLES=false` |
-| Postgres | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` |
-| MinIO | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `MINIO_SERVER_URL`, `MINIO_BROWSER_REDIRECT_URL` |
-
-Parollar yalnız `.env`-dədir və kodda yoxdur. Spark job MinIO məlumatlarını mühit dəyişənlərindən, Postgres login/parolunu isə DAG-ın ötürdüyü `PG_USER` / `PG_PASSWORD` dəyişənlərindən oxuyur.
-
----
-
-## 4. Data
-
-Bazanın adı `airflow`-dur, cədvəl `public.credit_applications`:
-
-| Sütun | Tip |
-|---|---|
-| `application_id` | `INT PRIMARY KEY` |
-| `customer_id` | `VARCHAR(10)` |
-| `customer_name` | `VARCHAR(100)` |
-| `requested_amount`, `monthly_income`, `existing_debt` | `NUMERIC(12,2)` |
-| `employment_years` | `NUMERIC(4,1)` |
-| `age` | `INT` |
-| `application_date` | `DATE` |
-
-SQL faylları: [`sql/create_table.sql`](sql/create_table.sql), [`sql/insert.sql`](sql/insert.sql). Cədvəl 10 sətirlə doldurulub:
-
-![Cədvəl](screenshots/03_dbeaver_table.png)
-
-Tarixlərə görə paylanma `2026-03-11` üçün 2, `2026-03-12` üçün 8 sətirdir. Bu rəqəmlər branch məntiqinin əsasını təşkil edir:
-
-![Tarixlərə görə say](screenshots/04_dbeaver_counts.png)
-
-**`airflow/data/blacklist.csv`:**
+**Blacklist (`airflow/data/blacklist.csv`):**
 
 ```csv
 customer_id,reason
@@ -141,188 +107,186 @@ C108,default
 C999,old_case
 ```
 
-`C999` bazada yoxdur, ona görə heç bir müraciətlə uyğun gəlmir.
+`C999` mənbə cədvəldə olmadığı üçün LEFT JOIN nəticəsində yeni müraciət yaratmır. PostgreSQL-də `customer_id` dəyərlərinin əvvəlində boşluq ola bildiyinə görə **hər iki DataFrame-də `trim(customer_id)`** JOIN-dən əvvəl tətbiq olunur.
 
-> `customer.csv` faylında vergüldən sonra boşluqlar var (`1, C101, ...`). `COPY` ilə yükləndikdə mətn sütunlarında əvvəldə boşluq qala bilər. Spark job join-dən əvvəl `customer_id` üzərində `upper(trim(...))` tətbiq etdiyi üçün bu, nəticəyə təsir etmir. `insert.sql` isə təmiz dəyərlərlə yazılıb.
+**Risk qaydalarının prioriteti:**
 
----
+| Status | Qayda |
+|---|---|
+| `rejected` | `reason IS NOT NULL` — müştəri blacklist-dədir |
+| `high_risk` | `requested_amount > monthly_income × 12` **OR** `existing_debt > monthly_income × 0.7` **OR** `employment_years < 1` **OR** `age < 21` |
+| `approved` | Digər müraciətlər |
 
-## 5. Connection və Variable
+Əvvəlcə `rejected` yoxlanır: blacklist-də olan müraciət digər risk şərtlərinə də düşsə, yenə `rejected` seçilir.
 
-| Connection ID | Tip | Parametrlər |
+| Customer ID | Status | Əsas səbəb |
 |---|---|---|
-| `pg_conn_id` | Postgres | host `postgres`, port `5432`, schema `airflow`, login/parol `.env`-dən |
-| `spark_default` | Spark | host `local[*]` |
-| `fs_default` | File (path) | Extra `{"path": "/"}` |
+| C101 | approved | Risk şərti ödənmir |
+| C102 | high_risk | Kredit məbləği illik gəliri keçir |
+| C103 | high_risk | Mövcud borc aylıq gəlirin 70%-indən çoxdur |
+| C104 | high_risk | İş stajı 1 ildən azdır |
+| C105 | high_risk | Yaş 21-dən aşağıdır |
+| C106 | approved | Risk şərti ödənmir |
+| C107 | rejected | Blacklist: `fraud` |
+| C108 | rejected | Blacklist: `default` |
+| C109 | approved | Risk şərti ödənmir |
+| C110 | approved | Risk şərti ödənmir |
 
-(Screenshot-da həmçinin əvvəlki işlərdən qalan `minio_s3` Connection-ı görünür, bu pipeline onu istifadə etmir.)
+## 5. Konfiqurasiya
 
-![Connections](screenshots/01_connections.png)
+### Airflow Connections
 
-**Variable `credit_pipeline_config`:**
+| Connection ID | Tip | Əsas dəyərlər |
+|---|---|---|
+| `pg_conn_id` | Postgres | Host `postgres`, port `5432`, database/schema `airflow`, DB login/parol |
+| `minio_s3` | Amazon Web Services | MinIO access key / secret key, `endpoint_url=http://minio:9000` |
+| `spark_default` | Spark | Master/host `local[*]` |
+| `fs_default` | File (path) | **Path `/`**; connection extra kimi `{"path": "/"}` |
+
+**Vacib:** File (path) Connection-ında `path` dəyəri ayrıca sahədə **yalnız `/`** olmalıdır; bütöv JSON-u `Path` sahəsinə mətn kimi yapışdırmaq düzgün deyil.
+
+### Airflow Variable
+
+`credit_pipeline_config` (JSON):
 
 ```json
-{"postgres_table": "public.credit_applications", "s3_path": "s3a://credit/delta/credit_applications"}
+{
+  "postgres_table": "public.credit_applications",
+  "s3_path": "s3a://credit/delta/credit_applications"
+}
 ```
 
-![Variable](screenshots/02_variable.png)
+`credit` adlı MinIO bucket əvvəlcədən mövcud olmalıdır. Bu layihədə istifadə olunan lokal database `airflow`-dur. Məlumatlar fərqli mühitə köçürüləndə Connection və Variable dəyərləri yenilənməlidir.
 
-Cədvəl adı və S3 yolu DAG-da və Spark job-da sabit yazılmır, Variable-dan gəlir.
+### Security / credentials
 
----
+- `.env` faylı Git-ə əlavə edilmir; `.env.example` nümunə kimi saxlanır.
+- Spark prosesinə DB və MinIO dəyərləri Airflow Connection-larından templated `env_vars` ilə ötürülür: `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD`, `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`.
+- Parol və secret-ləri README-yə, screenshot-lara və `git commit`-ə daxil etməyin.
 
-## 6. Spark job
+## 6. Airflow DAG və Spark job
 
-Fayl: `airflow/spark_jobs/credit_risk_job.py`. Parametrlər: `--table` və `--s3-path` (DAG-dan gəlir).
+**Airflow DAG:** `airflow/dags/credit_risk_pipeline.py`  
+**DAG ID:** `credit_risk_pipeline_updated`  
+**Schedule:** `None` (manual trigger), `catchup=False`, `max_active_runs=1`.
 
-**İş ardıcıllığı:**
-1. `PG_USER`, `PG_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` mühit dəyişənlərini oxuyur.
-2. `SparkSession` yaradır, Delta extension və catalog-u aktivləşdirir.
-3. Hadoop konfiqurasiyasında MinIO-nu qoşur: endpoint `http://minio:9000`, `path.style.access=true`, SSL söndürülüb.
-4. `credit_applications`-u JDBC ilə oxuyur, `customer_id`-ni `upper(trim())` ilə təmizləyir.
-5. `blacklist.csv`-ni oxuyur, `distinct()` edir və `is_blacklisted = true` sütunu əlavə edir.
-6. **Left join** edir. `risk_status` sütununu `when / when / otherwise` ilə hesablayır (qaydalar 1-ci bölmədəki kimidir), köməkçi sütunu silir.
-7. Hər statusun sayını `print` edir.
-8. Say `{approved: 4, high_risk: 4, rejected: 2}` ilə uyğun gəlmirsə `ValueError` atır və Delta-ya yazılmır.
-9. Nəticəni `delta` formatında, `application_date` üzrə `partitionBy` ilə, `overwrite` rejimində yazır.
-10. `finally` blokunda `spark.stop()` çağırır.
+- Əvvəlki günün hesabı `ds_add(ds, -1)` ilə edilir (`get_yesterday` custom macro).
+- `SqlSensor` və `FileSensor`: `mode="reschedule"`, `poke_interval=10`, `timeout=60`.
+- Branch seçimi `PostgresHook` ilə həmin günün `COUNT(*)` nəticəsinə əsaslanır.
+- `failure_callback` uğursuz task üçün DAG ID və task ID-ni loglayır.
+- `SparkSubmitOperator` Spark job-a cədvəl adı və S3A yolunu **iki positional arqument** kimi ötürür. Spark job onları `sys.argv[1]`, `sys.argv[2]` ilə oxuyur (köhnə `--table` / `--s3-path` və `argparse` variantı deyil).
+- Spark üçün Delta extensions/catalog `SparkSubmitOperator.conf` ilə, MinIO S3A parametrləri `SparkSession` üzərində qurulur.
+- Job SQL/JDBC-dən applications, lokal CSV-dən blacklist oxuyur; `trim()` + LEFT JOIN + `when()` / `otherwise()` ilə təsnifat aparır.
 
-**Gözlənilən nəticənin əl ilə yoxlanması:**
+**Delta write və read-back:**
 
-| Müştəri | Səbəb | Status |
-|---|---|---|
-| C101 | heç bir şərt ödənmir | approved |
-| C102 | 50 000 > 3 000 × 12 | high_risk |
-| C103 | borc 1 800 > 2 000 × 0.7 | high_risk |
-| C104 | staj 0.5 < 1 | high_risk |
-| C105 | yaş 19 < 21 | high_risk |
-| C106 | heç bir şərt ödənmir | approved |
-| C107 | blacklist | rejected |
-| C108 | blacklist | rejected |
-| C109 | heç bir şərt ödənmir | approved |
-| C110 | heç bir şərt ödənmir | approved |
+```python
+result_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .partitionBy("application_date") \
+    .save(s3_path)
 
-Real run-ın logunda da `approved 4`, `high_risk 4`, `rejected 2` və `DELTA WRITE SUCCESS: s3a://credit/delta/credit_applications` sətirləri çıxıb.
-
----
-
-## 7. DAG
-
-Fayl: `airflow/dags/credit_risk_pipeline.py`. `dag_id="credit_risk_pipeline"`, `schedule=None` (yalnız əl ilə trigger), `catchup=False`, `max_active_runs=1`, `retries=0`. Default argument-lərdə `on_failure_callback` təyin olunub.
-
-```mermaid
-flowchart LR
-    start --> A[check_yesterday_data]
-    start --> B[check_blacklist_file]
-    A --> br{branch_on_row_count}
-    B --> br
-    br -->|row_count > 2| rs[run_spark]
-    br -->|row_count <= 2| ft[fail_task]
-    rs --> rb[run_spark_bash]
-    rb --> e[end_task]
-    ft --> e
+delta_df = spark.read.format("delta").load(s3_path)
+print("Delta records:", delta_df.count())
+delta_df.groupBy("risk_status").count().show()
 ```
 
-| Task | Operator | Təsvir |
-|---|---|---|
-| `start` | `EmptyOperator` | Boş başlanğıc. |
-| `check_yesterday_data` | `SqlSensor` | `pg_conn_id` ilə dünənki sətir sayına baxır. Cədvəl adı Variable-dan gəlir. `reschedule` modu, `poke_interval=10`, `timeout=60`. |
-| `check_blacklist_file` | `FileSensor` | `fs_default` ilə `/opt/airflow/data/blacklist.csv` faylını yoxlayır. Eyni `reschedule`/`10`/`60` parametrləri. |
-| `branch_on_row_count` | `BranchPythonOperator` | `PostgresHook` ilə dünənki sətirləri sayır. `> 2` olsa `run_spark`, əks halda `fail_task` qaytarır. |
-| `fail_task` | `PythonOperator` | `AirflowFailException` ilə qəsdən xəta verir. |
-| `run_spark` | `SparkSubmitOperator` | `spark_default` Connection ilə job-u işə salır. Delta, Postgres və hadoop-aws paketlərini `--packages` ilə yükləyir. Postgres login və parolunu `pg_conn_id`-dən `env_vars` ilə ötürür. |
-| `run_spark_bash` | `BashOperator` | Bonus, aşağıda. |
-| `end_task` | `EmptyOperator` | `trigger_rule="all_done"` ilə son task. |
+Bu lokal demo hər işə düşəndə **bütün 10 müraciəti** oxuyub Delta cədvəlini `overwrite` edir. Branch isə **yalnız əvvəlki günə aid müraciət sayını** yoxlayır. Yəni müsbət run üçün 8 müraciət həddi işə düşür, lakin çıxış cədvəlində hər iki günün 10 müraciəti saxlanılır. `overwriteSchema=true` mövcud Delta cədvəlinin sxem/partition fərqləri üçün əlavə edilib. Bu, dəyişən günləri inkremental yükləyən production pipeline deyil.
 
-### "Dünən" hesabı
-`logical_date - 1 gün` hesabı **bir** funksiyada yazılıb (`get_yesterday`) və həm Jinja template-də (`SqlSensor`), həm də Python-da (`branch_on_row_count`) eyni funksiya istifadə olunur. Logical date UTC ilə saxlanır. UI-da GMT+4 ilə seçilən tarix UTC-də əvvəlki günə düşə bilər, məsələn UI-da `14.03.2026 00:00:01` yazmaq UTC-də `13.03.2026 20:00:01` verir və "dünən" `2026-03-12` çıxır.
+MinIO strukturunun gözlənilən görünüşü:
+
+```text
+s3a://credit/delta/credit_applications/
+├── _delta_log/
+├── application_date=2026-03-11/
+└── application_date=2026-03-12/
+```
+
+## 7. Real testlər və ekran görüntüləri
+
+### Test A — Müsbət branch (`run_spark`)
+
+- **Logical date (UTC):** `2026-03-13T04:00:00+00:00`
+- **Yoxlanılan gün:** `2026-03-12` → 8 müraciət.
+- `check_yesterday_data` / `check_blacklist_file` / `branch_on_row_count` → **SUCCESS**.
+- `run_spark` → **SUCCESS**, `fail_task` → **SKIPPED**.
+- `end_task` və `final_status` → **SUCCESS**; ümumi DAG Run → **SUCCESS**.
+- Screenshot-da görünən v4 run təxminən **27 saniyə** çəkib.
+
+![Successful branch — Airflow DAG v4](screenshots/01_happy_path_v4.png)
+
+### Test B — Mənfi branch (`fail_task`)
+
+- **Logical date (UTC):** `2026-03-12T05:00:00+00:00`
+- **Yoxlanılan gün:** `2026-03-11` → 2 müraciət.
+- `run_spark` → **SKIPPED**; `fail_task` → **FAILED** (gözlənilən davranış).
+- `end_task` → **SUCCESS** (`all_done` olduğu üçün).
+- `final_status` → **UPSTREAM_FAILED**; ümumi DAG Run → **FAILED**.
+
+![Negative branch — Airflow DAG v4](screenshots/02_failure_path_v4.png)
 
 ### Failure callback
-Task fail olanda `failure_callback` log-a qısa mesaj yazır: hansı DAG, hansı task, status `FAILED`.
 
-### Niyə `end_task` üçün `all_done`?
-Branch yalnız bir yolu işlədir, digər yol skip olur, `fail_task` isə qəsdən xəta verir. Default `all_success` qaydası ilə `end_task` bu hallarda işləməzdi. `all_done` isə qabaqkı tasklar uğurlu, uğursuz və ya skip olsa da `end_task`-ı işə salır. Yan təsir olaraq `fail_task` fail olsa belə, DAG run-ın özü `Success` görünür, çünki son task yaşıl bitir.
+Mənfi testlər zamanı `AirflowFailException` və callback log mesajı təsdiqlənib. Aşağıdakı callback görüntüsü yekun `final_status` task-ı əlavə edilməmiş əvvəlki testdən götürülüb; callback funksiyasının öz davranışı eynidir.
 
----
+```text
+AirflowFailException: Dunenin kredit muracietlerinin sayi 2-den cox deyil!
+FAILED! DAG: credit_risk_pipeline_updated, Task: fail_task
+```
 
-## 8. Testlər və screenshot-lar
+![Fail task — exception and failure callback log](screenshots/03_failure_callback_log.png)
 
-### Test 1: Fail path
-Logical date `2026-03-13`. UTC-də `2026-03-12 20:00`, dünən `2026-03-11`, orada 2 sətir var. `row_count > 2` ödənmir və branch `fail_task`-a gedir. `fail_task` fail olur, `run_spark` skip olur, `end_task` yenə işləyir. *(Bu run DAG-ın ilk versiyası ilə yaranıb, ona görə qrafda bonus task yoxdur.)*
+### MinIO / Delta Lake
 
-![Graph, fail path](screenshots/05_graph_fail_path.png)
+`credit/delta/credit_applications/` daxilində `_delta_log` və hər iki `application_date` partition-u mövcuddur:
 
-### Test 2: Happy path
-Logical date `2026-03-14 00:00:01`. UTC-də `2026-03-13 20:00:01`, dünən `2026-03-12`, orada 8 sətir var. Branch `run_spark`-a gedir, `fail_task` skip olur, hər iki Spark task-ı və `end_task` uğurla bitir.
+![Delta Lake table in MinIO](screenshots/04_delta_table_minio.png)
 
-![Graph, happy path](screenshots/06_graph_happy_path.png)
+## 8. Lokal işə salma
 
-Task-ların vaxtları ardıcıllığı təsdiqləyir: `run_spark` bitəndən sonra `run_spark_bash`, ondan sonra `end_task` işləyib.
+**Şərtlər:** Docker Desktop + Docker Compose və lokal Docker mühitinin işləməsi.
 
-![Task instances](screenshots/07_task_instances.png)
+1. `.env.example`-a əsasən lokal `.env` qurun. Əsl parolları GitHub-a paylaşmayın.
+2. Docker Compose servislərini başladın:
 
-### Əlavə müşahidə: sensor timeout
-Dünən üçün data olmayan tarixlə trigger edəndə `check_yesterday_data` 60 saniyə sonra timeout verir, `branch_on_row_count`, `run_spark` və `fail_task` `upstream_failed` olur, `end_task` isə `all_done` sayəsində yenə işləyir.
-
-![Sensor timeout](screenshots/09_sensor_timeout_grid.png)
-
-### MinIO nəticəsi
-`credit/delta/credit_applications/` içində `_delta_log/` və hər `application_date` üçün ayrıca partition qovluğu var.
-
-![MinIO Delta](screenshots/08_minio_delta.png)
-
----
-
-## 9. Bonus
-
-- **TaskGroup (+5):** iki sensor `data_checks` TaskGroup-una yığılıb. Task ID-lər `data_checks.check_yesterday_data` və `data_checks.check_blacklist_file` olur.
-- **BashOperator ilə Spark (+5):** `run_spark_bash` eyni job-u `spark-submit` əmri ilə işə salır:
-  - `--master` dəyəri `spark_default` Connection-ın host sahəsindən, tək dırnaq içində gəlir (`local[*]` shell glob olmasın deyə).
-  - `--table` və `--s3-path` Variable-dan template ilə gəlir.
-  - `PG_USER` / `PG_PASSWORD` komanda sətrində yox, `env=` ilə ötürülür, ona görə log-da görünmür.
-  - `append_env=True` konteynerin digər mühit dəyişənlərini (`PATH`, MinIO açarları) saxlayır.
-  - Task `run_spark`-dan sonra ardıcıl işləyir. Paralel işləsə, iki Spark eyni Delta yoluna yazar və eyni Ivy cache-i istifadə edərdi.
-
----
-
-## 10. Necə işə salmaq olar
-
-1. `.env` faylını yaradın (`_env` nümunəsindən) və dəyərləri doldurun.
-2. Stack-i qaldırın:
-   ```bash
+   ```powershell
    docker compose up -d --build
    ```
-3. Airflow UI-a daxil olun: http://localhost:8080. MinIO Console: http://localhost:9001.
-4. Postgres-ə qoşulun (host `localhost`, port `5436`, baza `airflow`) və `sql/create_table.sql`, sonra `sql/insert.sql` faylını işlədin.
-5. `airflow/data/blacklist.csv` faylını yaradın.
-6. MinIO-da `credit` bucket-ini yaradın.
-7. Airflow-da 5-ci bölmədəki üç Connection-ı və `credit_pipeline_config` Variable-ını yaradın.
-8. `credit_risk_pipeline` DAG-ını aktiv edib trigger edin. Happy path üçün logical date-i elə seçin ki, UTC-də dünən `2026-03-12` olsun.
-9. İlk Spark run-ı Maven paketlərini yükləyir və bir neçə dəqiqə çəkə bilər.
+
+3. PostgreSQL-də `sql/create_table.sql` və `sql/insert.sql` faylları ilə test datasını qurun; `airflow/data/blacklist.csv` faylını əlavə edin.
+4. MinIO Console-da `credit` bucket yaradın: <http://localhost:9001>.
+5. Airflow UI-də yuxarıdakı dörd Connection-u və `credit_pipeline_config` Variable-ını konfiqurasiya edin: <http://localhost:8080>.
+6. `credit_risk_pipeline_updated` DAG-ını aktivləşdirin və test üçün uyğun logical date seçin.
+
+**Müsbət ssenari nümunəsi** (2026-03-12 datasını yoxlayır):
+
+```powershell
+docker compose exec airflow-scheduler airflow dags trigger `
+  --logical-date 2026-03-13T06:00:00+00:00 `
+  credit_risk_pipeline_updated
+```
+
+**Mənfi ssenari nümunəsi** (2026-03-11 datasını yoxlayır):
+
+```powershell
+docker compose exec airflow-scheduler airflow dags trigger `
+  --logical-date 2026-03-12T06:00:00+00:00 `
+  credit_risk_pipeline_updated
+```
+
+> Eyni DAG üçün **eyni `logical_date` təkrar istifadə olunarsa** `dag_run_dag_id_logical_date_key` UniqueViolation alınacaq. Təkrar test üçün həmin gün daxilində yeni saat seçin və ya mövcud DAG Run-ı Airflow UI-dən clear edib yenidən başladın.
+
+## 9. Dizayn qeydləri və məhdudiyyətlər
+
+- **False-success problemi həll olunub:** Yalnız `end_task(all_done)` leaf olduqda `fail_task` uğursuz olsa belə DAG SUCCESS görünə bilirdi. Bunun üçün `final_status` (`none_failed_min_one_success`) həm `end_task`, həm `run_spark`, həm də `fail_task`-dan asılıdır; uğursuzluq bütöv DAG-a düzgün ötürülür.
+- **Runtime konfiqurasiya:** DAG parse zamanı top-level `Variable.get(...)` əvəzinə task daxilində `Variable.get` və templated `var.json` istifadə edilir.
+- **MinIO path:** CSV blacklist lokal Airflow volume-dan oxunur; yalnız Delta nəticələri MinIO-ya yazılır. `s3_path` dəyəri Airflow Variable-dan gəlir.
+- **Data quality:** Demo dataset üçün gözlənilən risk bölgüsü Spark logunda göstərilir; cari sadə işçi kodda hər status üçün ayrıca automated assertion/test suite qurulmayıb.
+- **Məlumatların təhlükəsizliyi:** Burada sintetik/test data və lokal xidmətlərdən istifadə olunur. Production mühitində secrets backend, müşahidə/alerting, incremental processing, data quality checks və daha sərt idarəetmə lazımdır.
+- **Bonus operatorlar:** Köhnə versiyada olan `TaskGroup` və ikinci `run_spark_bash` task-ı **bu yenilənmiş DAG-da yoxdur**; README artıq həmin köhnə arxitekturaya istinad etmir.
 
 ---
 
-## 11. Dizayn qərarları və qeydlər
-
-- **Baza və bucket adları:** tapşırıqda `credit_db` və `credit-bucket` yazılıb, bu layihədə isə `airflow` bazası və `credit` bucket-i istifadə olunub. Bütün konfiqurasiya buna uyğundur.
-- **Parol təhlükəsizliyi:** parollar yalnız `.env`-dədir. Postgres məlumatları Connection-dan `env_vars` ilə Spark-a ötürülür.
-- **Variable-dan oxuma:** `SparkSubmitOperator` üçün Variable DAG faylının yuxarısında `Variable.get(...)` ilə oxunur, `run_spark_bash` üçün isə template (`var.json...`) ilə. Template üsulu hər DAG parse-da bazaya getməməsi baxımından daha yaxşıdır.
-- **Sərt yazılmış dəyərlər:** Spark job-da JDBC URL (`jdbc:postgresql://postgres:5432/airflow`) və MinIO endpoint-i (`http://minio:9000`) kodda yazılıb. Başqa mühitdə bunlar parametrə çevrilə bilər.
-- **Overwrite:** happy path-də iki Spark task-ı eyni yola `overwrite` ilə yazır. Data eyni olduğu üçün nəticə dəyişmir, Delta isə yeni versiya yaradır.
-- **Deprecation xəbərdarlıqları:** `airflow.utils.task_group.TaskGroup` əvəzinə `airflow.sdk.TaskGroup`, `airflow.utils.trigger_rule.TriggerRule` əvəzinə `airflow.task.trigger_rule.TriggerRule` istifadə etmək olar.
-- **Log-dakı zərərsiz xəbərdarlıqlar:** `ps: command not found` (Spark start skripti), `MetricsConfig`, `Truncated the string representation`.
-
----
-
-## 12. Tapşırıq tələbləri: harada nə var
-
-| Tələb | Harada |
-|---|---|
-| Data, Connection, Variable | 4 və 5-ci bölmələr |
-| Spark job | 6-cı bölmə |
-| Sensorlar (reschedule, 10 san, 60 san) | 7-ci bölmə, `check_yesterday_data` və `check_blacklist_file` |
-| Branch, `fail_task`, callback | 7-ci bölmə |
-| `run_spark` | 7-ci bölmə |
-| `end_task` və `all_done` izahı | 7-ci bölmə, axırıncı başlıq |
-| Graph və MinIO screenshot-ları | 8-ci bölmə |
-| Bonus (TaskGroup, BashOperator) | 9-cu bölmə |
+**Repository:** [MahammadRasulovv/credit-risk-airflow-pipeline](https://github.com/MahammadRasulovv/credit-risk-airflow-pipeline)
